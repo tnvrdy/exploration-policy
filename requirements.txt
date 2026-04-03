@@ -1,0 +1,5 @@
+# browser automation (run: playwright install chromium)
+playwright>=1.40,<2
+
+# SDK used for both OpenAI and Qwen/DashScope
+openai>=1.0,<2
