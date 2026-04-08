@@ -5,11 +5,10 @@ Layout on disk:
     <base_dir>/
       traj_<id>/
         metadata.json
-        steps.jsonl # one JSON object per line, one per step
-        screenshots/
-          step_000.png
-          step_001.png
-          ...
+        steps.jsonl          # lightweight: action, url, title, ok, file paths
+        screenshots/step_000.png
+        ax_trees/step_000.txt
+        html/step_000.html
 
 Purely raw data capture, wrangling into chatml/training formats will happen downstream.
 """
@@ -26,6 +25,9 @@ from uuid import uuid4
 class TrajectoryWriter:
     """
     Accumulates steps for a single trajectory and writes them to disk.
+
+    Heavy fields (ax_tree, html) are written to separate files per step
+    so that steps.jsonl is easily human-readable.
 
     Usage:
         with TrajectoryWriter(base_dir, goal=goal, start_url=url) as tw:
@@ -48,6 +50,8 @@ class TrajectoryWriter:
 
         self.traj_dir = Path(base_dir) / self.trajectory_id
         self.screenshots_dir = self.traj_dir / "screenshots"
+        self.ax_trees_dir = self.traj_dir / "ax_trees"
+        self.html_dir = self.traj_dir / "html"
         self.steps_path = self.traj_dir / "steps.jsonl"
         self.metadata_path = self.traj_dir / "metadata.json"
 
@@ -59,6 +63,8 @@ class TrajectoryWriter:
     def __enter__(self) -> TrajectoryWriter:
         self.traj_dir.mkdir(parents=True, exist_ok=True)
         self.screenshots_dir.mkdir(exist_ok=True)
+        self.ax_trees_dir.mkdir(exist_ok=True)
+        self.html_dir.mkdir(exist_ok=True)
         self._steps_file = open(self.steps_path, "a")
         return self
 
@@ -66,7 +72,6 @@ class TrajectoryWriter:
         if self._steps_file:
             self._steps_file.close()
         self._write_metadata()
-
 
     def screenshot_path_for(self, step: int) -> Path:
         """Return the screenshot path for a given step number."""
@@ -81,27 +86,24 @@ class TrajectoryWriter:
         action_ok: bool,
         extra: dict | None = None,
     ) -> None:
-        """
-        Persist one step.
+        ax_tree = state.get("ax_tree", "")
+        html = state.get("html", "")
 
-        Args:
-            step: 0-based step index
-            state: dict from BrowserEnv.capture_full_state(). must contain
-                   "url", "title", "ax_tree", "html", "screenshot_path"
-            action: raw action string the agent produced
-            action_ok: whether the action executed successfully
-            extra: any additional fields to include in the step record
-        """
+        ax_path = self.ax_trees_dir / f"step_{step:03d}.txt"
+        html_path = self.html_dir / f"step_{step:03d}.html"
+        ax_path.write_text(ax_tree, encoding="utf-8")
+        html_path.write_text(html, encoding="utf-8")
+
         record: dict[str, Any] = {
             "step": step,
             "timestamp": _now_iso(),
             "url": state.get("url", ""),
             "title": state.get("title", ""),
-            "ax_tree": state.get("ax_tree", ""),
-            "html": state.get("html", ""),
-            "screenshot_path": state.get("screenshot_path", ""),
             "action": action,
             "action_ok": action_ok,
+            "screenshot_path": state.get("screenshot_path", ""),
+            "ax_tree_path": str(ax_path),
+            "html_path": str(html_path),
         }
         if extra:
             record.update(extra)
@@ -117,7 +119,6 @@ class TrajectoryWriter:
         """Update the goal after trajectory collection (for retroactive labeling)."""
         self.goal = goal
 
-
     def _write_metadata(self) -> None:
         meta = {
             "trajectory_id": self.trajectory_id,
@@ -131,6 +132,7 @@ class TrajectoryWriter:
         self.metadata_path.write_text(
             json.dumps(meta, indent=2, ensure_ascii=False) + "\n"
         )
+
 
 # post-hoc metadata updates
 
@@ -147,11 +149,17 @@ def update_metadata(traj_dir: str | Path, updates: dict) -> dict:
     return meta
 
 
-# load/read trajectories (for judge, decomposer)
+# load/read trajectories
 
-def load_trajectory(traj_dir: str | Path) -> dict:
+def load_trajectory(traj_dir: str | Path, include_heavy: bool = True) -> dict:
     """
     Load a single trajectory from disk.
+
+    Args:
+        traj_dir: path to the trajectory directory
+        include_heavy: if True (default), read ax_tree and html content
+            from their separate files and include them in each step dict.
+            If False, steps only contain the lightweight fields from steps.jsonl.
 
     Returns:
         {"metadata": dict, "steps": list[dict]}
@@ -168,7 +176,15 @@ def load_trajectory(traj_dir: str | Path) -> dict:
             for line in f:
                 line = line.strip()
                 if line:
-                    steps.append(json.loads(line))
+                    step = json.loads(line)
+
+                    if include_heavy:
+                        ax_path = step.get("ax_tree_path", "")
+                        html_path = step.get("html_path", "")
+                        step["ax_tree"] = Path(ax_path).read_text(encoding="utf-8") if ax_path else ""
+                        step["html"] = Path(html_path).read_text(encoding="utf-8") if html_path else ""
+
+                    steps.append(step)
 
     return {"metadata": metadata, "steps": steps}
 
