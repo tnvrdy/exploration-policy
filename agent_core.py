@@ -10,7 +10,7 @@ from llm import chat
 from trajectory_store import TrajectoryWriter
 
 
-SYSTEM_PROMPT = f"""You are an autonomous browser agent. You control a real web browser.
+_GOAL_DIRECTED_SYSTEM_PROMPT = f"""You are an autonomous browser agent. You control a real web browser.
 
 Each turn you will receive:
   - GOAL: the task you must complete
@@ -29,25 +29,45 @@ Rules:
 4. If the page does not help and you cannot make progress, output: stop""".strip()
 
 
-def build_user_message(
-    goal: str,
+_FREEFORM_SYSTEM_PROMPT = f"""You are a curious web user browsing the internet naturally. You control a real web browser.
+
+Each turn you will receive:
+  - URL: the current page URL
+  - PAGE: a numbered list of interactive elements on the current page
+  - HISTORY: the actions you have already taken (empty on the first turn)
+
+Browse as a real person would — follow links that look interesting, search for things, \
+interact with the page, explore content in depth. Act naturally and purposefully. \
+Do NOT just scroll repeatedly or click randomly. Each action should reflect genuine \
+human curiosity or intent.
+
+{ACTION_VOCABULARY}
+
+Rules:
+1. Output EXACTLY ONE action per reply, on a single line. Nothing else — no explanation, no preamble.
+2. Use only the actions listed above. Any other output will be treated as a parse error.
+3. Do NOT output stop — keep exploring for the full session.""".strip()
+
+
+def _build_user_message(
     obs_text: str,
     action_history: list[str],
+    goal: str | None = None,
 ) -> str:
     history_block = (
         "\n".join(f"  {i + 1}. {a}" for i, a in enumerate(action_history))
         if action_history
         else "  (none)"
     )
-    return (
-        f"GOAL: {goal}\n\n"
-        f"HISTORY:\n{history_block}\n\n"
-        f"PAGE:\n{obs_text}"
-    )
+    parts = []
+    if goal:
+        parts.append(f"GOAL: {goal}\n")
+    parts.append(f"HISTORY:\n{history_block}\n")
+    parts.append(f"PAGE:\n{obs_text}")
+    return "\n".join(parts)
 
 
-def first_line(text: str) -> str:
-    """Extract the first non-empty line from model output."""
+def _first_line(text: str) -> str:
     for line in text.splitlines():
         stripped = line.strip()
         if stripped:
@@ -55,8 +75,7 @@ def first_line(text: str) -> str:
     return text.strip()
 
 
-def annotate_action(parsed, raw: str, obs: Observation, env: BrowserEnv) -> str:
-    """Build a history entry with semantic context."""
+def _annotate_action(parsed, raw: str, obs: Observation, env: BrowserEnv) -> str:
     if parsed.action_type == "click" and parsed.index is not None:
         label = (
             obs.element_descs[parsed.index]
@@ -71,20 +90,26 @@ def annotate_action(parsed, raw: str, obs: Observation, env: BrowserEnv) -> str:
     return raw
 
 
-def run_episode_steps(
+def run_steps(
     env: BrowserEnv,
     tw: TrajectoryWriter,
-    goal: str,
+    goal: str | None = None,
     model: str | None = None,
     max_steps: int = 4,
 ) -> str:
     """
-    Run the core observe -> act -> record loop for one micro-episode.
+    Core observe -> act -> record loop.
 
-    Assumes env is already navigated to a starting page and tw is open.
-    Returns the termination reason string
+    If goal is provided, the agent works toward it (goal-directed mode).
+    If goal is None, the agent browses freely (freeform mode) and stop
+    actions are ignored.
+
+    Assumes env is already navigated to a page and tw is open.
+    Returns the termination reason string.
     """
-    system_msg = {"role": "system", "content": SYSTEM_PROMPT}
+    freeform = goal is None
+    system_prompt = _FREEFORM_SYSTEM_PROMPT if freeform else _GOAL_DIRECTED_SYSTEM_PROMPT
+    system_msg = {"role": "system", "content": system_prompt}
     action_history: list[str] = []
     consecutive_failures = 0
 
@@ -93,10 +118,10 @@ def run_episode_steps(
 
         user_msg = {
             "role": "user",
-            "content": build_user_message(goal, obs.text, action_history),
+            "content": _build_user_message(obs.text, action_history, goal=goal),
         }
         raw_full = chat([system_msg, user_msg], model=model)
-        raw = first_line(raw_full)
+        raw = _first_line(raw_full)
         print(f"  [step {step_num}] model: {raw}")
 
         parsed = None
@@ -109,8 +134,12 @@ def run_episode_steps(
 
         exec_result: dict | None = None
         if parsed is not None:
-            exec_result = env.execute_action(parsed)
-            print(f"  [step {step_num}] exec: {exec_result!r}")
+            if freeform and parsed.action_type == "stop":
+                print(f"  [step {step_num}] ignoring stop (freeform mode)")
+                parsed = None
+            else:
+                exec_result = env.execute_action(parsed)
+                print(f"  [step {step_num}] exec: {exec_result!r}")
 
         screenshot_path = tw.screenshot_path_for(step_num)
         state = env.capture_full_state(screenshot_path)
@@ -135,10 +164,10 @@ def run_episode_steps(
                 consecutive_failures += 1
             else:
                 consecutive_failures = 0
-                history_entry = annotate_action(parsed, raw, obs, env)
+                history_entry = _annotate_action(parsed, raw, obs, env)
             action_history.append(history_entry)
 
-        if parsed is not None and parsed.action_type == "stop":
+        if not freeform and parsed is not None and parsed.action_type == "stop":
             return "stop"
         if consecutive_failures >= 3:
             return "consecutive_failures"
