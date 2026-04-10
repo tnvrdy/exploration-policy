@@ -4,6 +4,8 @@ Shared step-loop logic used by both goal-directed and freeform exploration agent
 
 from __future__ import annotations
 
+import time
+
 from actions import ACTION_VOCABULARY, ActionParseError, parse_action
 from browser_env import BrowserEnv, Observation
 from llm import chat
@@ -101,6 +103,7 @@ def run_steps(
     goal: str | None = None,
     model: str | None = None,
     max_steps: int = 4,
+    include_raw_model_output: bool = False,
 ) -> str:
     """
     Core observe -> act -> record loop.
@@ -119,8 +122,10 @@ def run_steps(
     consecutive_failures = 0
     consecutive_repeats = 0
     last_action: str | None = None
+    step_latencies_ms: list[float] = []
 
     for step_num in range(max_steps):
+        step_start = time.perf_counter()
         obs = env.get_text_observation()
 
         user_msg = {
@@ -158,17 +163,21 @@ def run_steps(
         state = env.capture_full_state(screenshot_path)
 
         exec_ok = bool(exec_result and exec_result.get("ok"))
+        extra = {
+            "parse_error": parse_error,
+            "exec_error": (exec_result or {}).get("error"),
+        }
+        if include_raw_model_output:
+            extra["raw_model_output"] = raw_full
+
         tw.write_step(
             step=step_num,
             state=state,
             action=raw,
             action_ok=exec_ok,
-            extra={
-                "parse_error": parse_error,
-                "exec_error": (exec_result or {}).get("error"),
-                "raw_model_output": raw_full,
-            },
+            extra=extra,
         )
+        step_latencies_ms.append((time.perf_counter() - step_start) * 1000.0)
 
         if parsed is not None:
             if not exec_ok:
@@ -181,11 +190,32 @@ def run_steps(
             action_history.append(history_entry)
 
         if not freeform and parsed is not None and parsed.action_type == "stop":
+            _record_runtime_metrics(tw, step_latencies_ms)
             return "stop"
         if consecutive_failures >= 3:
+            _record_runtime_metrics(tw, step_latencies_ms)
             return "consecutive_failures"
         if consecutive_repeats >= 2:
             print(f"  [step {step_num}] stuck: repeated {raw!r} 3 times")
+            _record_runtime_metrics(tw, step_latencies_ms)
             return "stuck"
 
+    _record_runtime_metrics(tw, step_latencies_ms)
     return "max_steps"
+
+
+def _record_runtime_metrics(tw: TrajectoryWriter, step_latencies_ms: list[float]) -> None:
+    if not step_latencies_ms:
+        return
+    sorted_lats = sorted(step_latencies_ms)
+    p95_idx = max(0, min(len(sorted_lats) - 1, int(len(sorted_lats) * 0.95) - 1))
+    tw.add_metadata(
+        {
+            "runtime_metrics": {
+                "steps_recorded": len(step_latencies_ms),
+                "avg_step_latency_ms": round(sum(step_latencies_ms) / len(step_latencies_ms), 2),
+                "p95_step_latency_ms": round(sorted_lats[p95_idx], 2),
+                "max_step_latency_ms": round(sorted_lats[-1], 2),
+            }
+        }
+    )
