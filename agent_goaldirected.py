@@ -21,12 +21,20 @@ from io_utils import dir_size_bytes
 from trajectory_store import TrajectoryWriter, load_trajectory
 
 
+def _validate_max_steps(max_steps: int) -> int:
+    if max_steps < 1:
+        raise ValueError("max_steps must be >= 1")
+    if max_steps > 50:
+        raise ValueError("max_steps must be <= 50 (hard cap)")
+    return max_steps
+
+
 def run_exploration_episode(
     url: str,
     goal: str,
     trajectories_dir: str | Path = "trajectories",
     model: str | None = None,
-    max_steps: int = 4,
+    max_steps: int = 25,
     headless: bool = True,
     writer_flush_every: int = 1,
     writer_async: bool = False,
@@ -36,6 +44,7 @@ def run_exploration_episode(
     io_config: CollectionIOConfig | None = None,
 ) -> Path:
     """Run one episode with its own browser. Fine for testing, not for scale."""
+    max_steps = _validate_max_steps(max_steps)
     cfg = resolve_io_config(
         io_config,
         writer_flush_every=writer_flush_every,
@@ -75,7 +84,7 @@ def run_task_batch(
     tasks: list[dict],
     trajectories_dir: str | Path = "trajectories",
     model: str | None = None,
-    max_steps: int = 4,
+    max_steps: int = 20,
     headless: bool = True,
     writer_flush_every: int = 1,
     writer_async: bool = False,
@@ -93,6 +102,7 @@ def run_task_batch(
     Returns a list of result dicts (one per task)
     """
     results: list[dict] = []
+    max_steps = _validate_max_steps(max_steps)
     cfg = resolve_io_config(
         io_config,
         writer_flush_every=writer_flush_every,
@@ -105,6 +115,7 @@ def run_task_batch(
     with BrowserEnv(headless=headless) as env:
         for i, task in enumerate(tasks):
             url, goal = task["url"], task["goal"]
+            seed_source = task.get("seed_source")
             try:
                 env.goto(url)
                 print(f"[batch {i + 1}/{len(tasks)}] goal={goal!r}  url={url}")
@@ -119,6 +130,8 @@ def run_task_batch(
                     queue_size=cfg.queue_size,
                     compress_heavy=cfg.compress_heavy,
                 ) as tw:
+                    if seed_source:
+                        tw.add_metadata({"seed_source": seed_source})
                     reason = run_steps(
                         env,
                         tw,
@@ -163,7 +176,7 @@ if __name__ == "__main__":
 
     _url = sys.argv[1]
     _goal = sys.argv[2]
-    _max = int(sys.argv[3]) if len(sys.argv) > 3 else 4
+    _max = int(sys.argv[3]) if len(sys.argv) > 3 else 20
 
     traj = run_exploration_episode(_url, _goal, max_steps=_max, headless=False)
     print(f"\nTrajectory saved: {traj}")

@@ -28,7 +28,7 @@ from browser_env import BrowserEnv
 from collection_config import CollectionIOConfig, resolve_io_config
 from llm import chat
 from trajectory_store import TrajectoryWriter, load_trajectory, update_metadata
-
+from agent_goaldirected import _validate_max_steps
 
 # Retroactive labeling prompt
 
@@ -141,7 +141,7 @@ def run_freeform_session(
     num_episodes: int = 5,
     trajectories_dir: str | Path = "trajectories",
     model: str | None = None,
-    max_steps: int = 8,
+    max_steps: int = 30,
     headless: bool = True,
     label_mode: str = "deferred",
     writer_flush_every: int = 1,
@@ -167,6 +167,7 @@ def run_freeform_session(
     """
     traj_dirs: list[Path] = []
     meaningful_count = 0
+    max_steps = _validate_max_steps(max_steps)
     cfg = resolve_io_config(
         io_config,
         writer_flush_every=writer_flush_every,
@@ -257,7 +258,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Freeform exploration (explore first, label after)")
     parser.add_argument("seed_url", help="Starting URL")
     parser.add_argument("--episodes", type=int, default=5, help="Number of micro-episodes")
-    parser.add_argument("--max-steps", type=int, default=8, help="Max steps per episode")
+    parser.add_argument("--max-steps", type=int, default=30, help="Max steps per episode (hard cap: 50)")
     parser.add_argument("-o", "--output", default="trajectories", help="Output directory")
     parser.add_argument("--model", default=None, help="LLM model override")
     parser.add_argument("--headed", action="store_true", help="Run in headed mode (visible browser)")
