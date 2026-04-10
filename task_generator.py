@@ -21,22 +21,37 @@ import re
 from pathlib import Path
 
 from llm import chat
+from seed_sources import (
+    ALL_SOURCES,
+    SOURCE_LONGTAIL,
+    SOURCE_MIND2WEB,
+    SOURCE_POPULAR,
+    SOURCE_WEBDS,
+    SOURCE_WEBVOYAGER,
+    SeedSite,
+    dedupe_seeds,
+    fetch_webds_seeds,
+    fetch_webvoyager_seeds,
+    generate_longtail_seeds,
+    generate_popular_seeds,
+    load_mind2web_seeds_from_file,
+    load_seed_corpus,
+    validate_seed_corpus,
+    write_seed_corpus,
+)
 
-# seed websites
-
+# fallback seeds (used if benchmark fetch fails / no custom corpus provided)
 DEFAULT_SEEDS: list[dict] = [
-    {"url": "https://en.wikipedia.org", "description": "Free encyclopedia with articles, internal links, tables, and references"},
-    {"url": "https://news.ycombinator.com", "description": "Tech news aggregator with ranked stories, comment threads, and job postings"},
-    {"url": "https://github.com/explore", "description": "Code hosting with repositories, issues, pull requests, trending projects, and topics"},
-    {"url": "https://www.bbc.com/news", "description": "International news with articles, sections, video, and live coverage"},
-    {"url": "https://arxiv.org", "description": "Academic preprint archive with search, abstracts, author pages, and subject categories"},
-    {"url": "https://www.allrecipes.com", "description": "Recipe site with search, categories, ingredients, instructions, and reviews"},
-    {"url": "https://www.craigslist.org", "description": "Classified ads organized by city and category: housing, jobs, for sale, services"},
-    {"url": "https://duckduckgo.com", "description": "Search engine with web search, instant answers, and image/video/news tabs"},
-    {"url": "https://www.weather.gov", "description": "US weather service with location search, forecasts, radar maps, and alerts"},
-    {"url": "https://www.openstreetmap.org", "description": "Open-source map with search, zoom, directions, and point-of-interest details"},
-    {"url": "https://www.gutenberg.org", "description": "Free ebooks with search, categories, book pages, and reading formats"},
-    {"url": "https://www.wolframalpha.com", "description": "Computational knowledge engine with queries, results, and step-by-step solutions"},
+    {"url": "https://en.wikipedia.org", "description": "Free encyclopedia with articles, internal links, tables, and references", "source": SOURCE_POPULAR},
+    {"url": "https://news.ycombinator.com", "description": "Tech news aggregator with ranked stories, comment threads, and job postings", "source": SOURCE_POPULAR},
+    {"url": "https://github.com/explore", "description": "Code hosting with repositories, issues, pull requests, trending projects, and topics", "source": SOURCE_WEBVOYAGER},
+    {"url": "https://arxiv.org", "description": "Academic preprint archive with search, abstracts, author pages, and subject categories", "source": SOURCE_WEBVOYAGER},
+    {"url": "https://www.bbc.com/news", "description": "International news with articles, sections, video, and live coverage", "source": SOURCE_WEBVOYAGER},
+    {"url": "https://www.allrecipes.com", "description": "Recipe site with search, categories, ingredients, instructions, and reviews", "source": SOURCE_WEBVOYAGER},
+    {"url": "https://www.weather.gov", "description": "US weather service with location search, forecasts, radar maps, and alerts", "source": SOURCE_LONGTAIL},
+    {"url": "https://www.openstreetmap.org", "description": "Open-source map with search, zoom, directions, and point-of-interest details", "source": SOURCE_LONGTAIL},
+    {"url": "https://www.craigslist.org", "description": "Classified ads organized by city and category: housing, jobs, for sale, services", "source": SOURCE_LONGTAIL},
+    {"url": "https://www.gutenberg.org", "description": "Free ebooks with search, categories, book pages, and reading formats", "source": SOURCE_LONGTAIL},
 ]
 
 # stage 0: generate diverse seed websites
@@ -142,7 +157,7 @@ RULES:
    verbs chained with "and" or "then", it's probably too procedural. Rewrite it \
    as what the agent should END UP having found/seen/reached.
 
-2. Tasks should require 3-8 actions. Not trivially easy.
+2. Tasks should usually require ~20 actions (longer, realistic objectives), but remain coherent and outcome-oriented.
    BAD:  "Go to the homepage"
    GOOD: "Find a highly-rated Italian recipe that takes under 30 minutes and has at least 50 reviews"
 
@@ -178,13 +193,16 @@ def _parse_json_list(raw: str) -> list:
     return result if isinstance(result, list) else []
 
 
-def _parse_tasks_response(raw: str, url: str) -> list[dict]:
+def _parse_tasks_response(raw: str, url: str, seed_source: str | None = None) -> list[dict]:
     items = _parse_json_list(raw)
     tasks = []
     for item in items:
         goal = item.get("goal", "").strip() if isinstance(item, dict) else ""
         if goal:
-            tasks.append({"url": url, "goal": goal})
+            row = {"url": url, "goal": goal}
+            if seed_source:
+                row["seed_source"] = seed_source
+            tasks.append(row)
     return tasks
 
 
@@ -209,6 +227,7 @@ def generate_tasks_for_site(
     description: str,
     n: int = 30,
     model: str | None = None,
+    seed_source: str | None = None,
 ) -> list[dict]:
     print(f"    stage 1: brainstorming activities ...")
     activities_text = _get_common_activities(url, description)
@@ -222,7 +241,99 @@ def generate_tasks_for_site(
         temperature=0.9,
         max_tokens=4096,
     )
-    return _parse_tasks_response(raw, url)
+    return _parse_tasks_response(raw, url, seed_source=seed_source)
+
+
+def _coerce_source_set(raw: str | None) -> set[str]:
+    if not raw:
+        return set(ALL_SOURCES)
+    parts = {p.strip().lower() for p in raw.split(",") if p.strip()}
+    return {p for p in parts if p in ALL_SOURCES}
+
+
+def _limit_by_source(seeds: list[dict], max_sites_per_source: int | None) -> list[dict]:
+    if not max_sites_per_source or max_sites_per_source <= 0:
+        return seeds
+    out: list[dict] = []
+    counts: dict[str, int] = {}
+    for s in seeds:
+        src = s.get("source", "unknown")
+        c = counts.get(src, 0)
+        if c >= max_sites_per_source:
+            continue
+        counts[src] = c + 1
+        out.append(s)
+    return out
+
+
+def _build_seed_pool(
+    *,
+    model: str | None,
+    num_sites: int | None,
+    seed_corpus_path: str | None,
+    seed_sources_csv: str | None,
+    max_sites_per_source: int | None,
+    mind2web_websites_file: str | None,
+    materialize_seed_corpus: str | None,
+) -> list[dict]:
+    if seed_corpus_path:
+        seeds = load_seed_corpus(seed_corpus_path)
+    else:
+        source_set = _coerce_source_set(seed_sources_csv)
+        bucket: list[SeedSite] = []
+
+        if SOURCE_WEBVOYAGER in source_set:
+            try:
+                bucket.extend(fetch_webvoyager_seeds())
+            except Exception as e:
+                print(f"  WARNING: failed to fetch WebVoyager seeds: {e}")
+        if SOURCE_WEBDS in source_set:
+            try:
+                bucket.extend(fetch_webds_seeds())
+            except Exception as e:
+                print(f"  WARNING: failed to fetch WebDS seeds: {e}")
+        if SOURCE_MIND2WEB in source_set and mind2web_websites_file:
+            try:
+                bucket.extend(load_mind2web_seeds_from_file(mind2web_websites_file))
+            except Exception as e:
+                print(f"  WARNING: failed to load Mind2Web websites file: {e}")
+        elif SOURCE_MIND2WEB in source_set:
+            print("  WARNING: mind2web source requested but --mind2web-websites-file not provided")
+
+        if SOURCE_POPULAR in source_set:
+            # if num_sites is small, keep popular/longtail generation bounded.
+            pop_n = 250 if not num_sites else max(50, min(500, num_sites // 2))
+            bucket.extend(generate_popular_seeds(pop_n, model=model))
+        if SOURCE_LONGTAIL in source_set:
+            lt_n = 250 if not num_sites else max(50, min(500, num_sites // 2))
+            bucket.extend(generate_longtail_seeds(lt_n, model=model))
+
+        if not bucket:
+            # strong fallback
+            seeds = list(DEFAULT_SEEDS)
+        else:
+            seeds = [s.as_dict() for s in dedupe_seeds(bucket)]
+
+    seeds = _limit_by_source(seeds, max_sites_per_source)
+    if num_sites:
+        seeds = seeds[:num_sites]
+
+    if materialize_seed_corpus:
+        serializable = [
+            SeedSite(
+                url=s["url"],
+                description=s.get("description", ""),
+                source=s.get("source", "unknown"),
+                domain=s.get("domain", ""),
+                tags=tuple(s.get("tags", [])),
+            )
+            for s in seeds
+        ]
+        write_seed_corpus(materialize_seed_corpus, serializable)
+
+    stats = validate_seed_corpus(seeds)
+    print(f"[seed-corpus] rows={stats['total_rows']} unique_domains={stats['unique_domains']} by_source={stats['by_source']}")
+    return seeds
 
 
 def generate_all_tasks(
@@ -231,15 +342,22 @@ def generate_all_tasks(
     output_path: str | Path = "tasks.jsonl",
     model: str | None = None,
     num_sites: int | None = None,
+    seed_corpus_path: str | None = None,
+    seed_sources_csv: str | None = None,
+    max_sites_per_source: int | None = None,
+    mind2web_websites_file: str | None = None,
+    materialize_seed_corpus: str | None = None,
 ) -> int:
     if seeds is None:
-        if num_sites and num_sites > len(DEFAULT_SEEDS):
-            seeds = generate_seed_sites(n=num_sites, model=model)
-        else:
-            seeds = DEFAULT_SEEDS
-
-    if num_sites:
-        seeds = seeds[:num_sites]
+        seeds = _build_seed_pool(
+            model=model,
+            num_sites=num_sites,
+            seed_corpus_path=seed_corpus_path,
+            seed_sources_csv=seed_sources_csv,
+            max_sites_per_source=max_sites_per_source,
+            mind2web_websites_file=mind2web_websites_file,
+            materialize_seed_corpus=materialize_seed_corpus,
+        )
 
     output_path = Path(output_path)
     total = 0
@@ -248,10 +366,11 @@ def generate_all_tasks(
         for i, seed in enumerate(seeds):
             url = seed["url"]
             desc = seed["description"]
+            src = seed.get("source")
             print(f"[{i + 1}/{len(seeds)}] {url}")
 
             try:
-                tasks = generate_tasks_for_site(url, desc, n=tasks_per_site, model=model)
+                tasks = generate_tasks_for_site(url, desc, n=tasks_per_site, model=model, seed_source=src)
             except Exception as e:
                 print(f"  WARNING: failed for {url}: {e}")
                 continue
@@ -281,16 +400,55 @@ if __name__ == "__main__":
     parser.add_argument("-o", "--output", default="tasks.jsonl", help="Output JSONL path")
     parser.add_argument("-n", "--tasks-per-site", type=int, default=30, help="Tasks per site")
     parser.add_argument("--seeds", default=None, help="Custom seeds JSONL (overrides generation)")
+    parser.add_argument("--seed-corpus", default=None, help="Canonical seed corpus JSONL to load")
+    parser.add_argument(
+        "--seed-sources",
+        default="webvoyager,mind2web,webds,popular,longtail",
+        help="Comma-separated seed sources to include",
+    )
+    parser.add_argument("--max-sites-per-source", type=int, default=None, help="Optional cap per source bucket")
+    parser.add_argument(
+        "--mind2web-websites-file",
+        default=None,
+        help="Path to a local list of Mind2Web websites (json/jsonl/txt)",
+    )
+    parser.add_argument(
+        "--materialize-seed-corpus",
+        default=None,
+        help="Write resolved seed pool to JSONL for reproducibility",
+    )
     parser.add_argument("--num-sites", type=int, default=None,
-                        help="Number of seed sites. If > default seeds, Stage 0 generates them via LLM.")
+                        help="Number of seed sites to use after filtering/deduplication.")
     parser.add_argument("--model", default=None, help="LLM model override")
+    parser.add_argument(
+        "--validate-seeds-only",
+        action="store_true",
+        help="Only resolve/validate seed corpus and exit without generating tasks",
+    )
     args = parser.parse_args()
 
     seeds = _load_seeds(args.seeds) if args.seeds else None
-    generate_all_tasks(
-        seeds=seeds,
-        tasks_per_site=args.tasks_per_site,
-        output_path=args.output,
-        model=args.model,
-        num_sites=args.num_sites,
-    )
+    if args.validate_seeds_only:
+        resolved = _build_seed_pool(
+            model=args.model,
+            num_sites=args.num_sites,
+            seed_corpus_path=args.seed_corpus,
+            seed_sources_csv=args.seed_sources,
+            max_sites_per_source=args.max_sites_per_source,
+            mind2web_websites_file=args.mind2web_websites_file,
+            materialize_seed_corpus=args.materialize_seed_corpus,
+        )
+        print(f"Validation complete. {len(resolved)} seeds resolved.")
+    else:
+        generate_all_tasks(
+            seeds=seeds,
+            tasks_per_site=args.tasks_per_site,
+            output_path=args.output,
+            model=args.model,
+            num_sites=args.num_sites,
+            seed_corpus_path=args.seed_corpus,
+            seed_sources_csv=args.seed_sources,
+            max_sites_per_source=args.max_sites_per_source,
+            mind2web_websites_file=args.mind2web_websites_file,
+            materialize_seed_corpus=args.materialize_seed_corpus,
+        )
