@@ -16,8 +16,8 @@ import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
-from collection_config import CollectionIOConfig, resolve_io_config
-from io_utils import dir_size_bytes
+from utils.collection_config import CollectionIOConfig, resolve_io_config
+from utils.io_utils import dir_size_bytes
 from agent.agent_goaldirected import _validate_max_steps
 
 

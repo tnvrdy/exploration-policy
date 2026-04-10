@@ -16,8 +16,8 @@ from pathlib import Path
 
 from agent.agent_core import run_steps
 from browser_env import BrowserEnv
-from collection_config import CollectionIOConfig, resolve_io_config
-from io_utils import dir_size_bytes
+from utils.collection_config import CollectionIOConfig, resolve_io_config
+from utils.io_utils import dir_size_bytes
 from trajectory_store import TrajectoryWriter, load_trajectory
 
 

@@ -25,7 +25,7 @@ from pathlib import Path
 
 from agent.agent_core import run_steps
 from browser_env import BrowserEnv
-from collection_config import CollectionIOConfig, resolve_io_config
+from utils.collection_config import CollectionIOConfig, resolve_io_config
 from llm import chat
 from trajectory_store import TrajectoryWriter, load_trajectory, update_metadata
 from agent.agent_goaldirected import _validate_max_steps
