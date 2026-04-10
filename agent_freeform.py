@@ -25,6 +25,7 @@ from pathlib import Path
 
 from agent_core import run_steps
 from browser_env import BrowserEnv
+from collection_config import CollectionIOConfig, resolve_io_config
 from llm import chat
 from trajectory_store import TrajectoryWriter, load_trajectory, update_metadata
 
@@ -148,6 +149,7 @@ def run_freeform_session(
     writer_queue_size: int = 256,
     compress_heavy: bool = False,
     include_raw_model_output: bool = False,
+    io_config: CollectionIOConfig | None = None,
 ) -> list[Path]:
     """
     Run a continuous freeform exploration session.
@@ -165,6 +167,14 @@ def run_freeform_session(
     """
     traj_dirs: list[Path] = []
     meaningful_count = 0
+    cfg = resolve_io_config(
+        io_config,
+        writer_flush_every=writer_flush_every,
+        writer_async=writer_async,
+        writer_queue_size=writer_queue_size,
+        compress_heavy=compress_heavy,
+        include_raw_model_output=include_raw_model_output,
+    )
 
     with BrowserEnv(headless=headless) as env:
         env.goto(seed_url)
@@ -179,10 +189,10 @@ def run_freeform_session(
                 trajectories_dir,
                 goal="(unlabeled)",
                 start_url=current_url,
-                flush_every=writer_flush_every,
-                async_writer=writer_async,
-                queue_size=writer_queue_size,
-                compress_heavy=compress_heavy,
+                flush_every=cfg.flush_every,
+                async_writer=cfg.async_writer,
+                queue_size=cfg.queue_size,
+                compress_heavy=cfg.compress_heavy,
             ) as tw:
                 ep_start = time.perf_counter()
                 reason = run_steps(
@@ -191,7 +201,7 @@ def run_freeform_session(
                     goal=None,
                     model=model,
                     max_steps=max_steps,
-                    include_raw_model_output=include_raw_model_output,
+                    include_raw_model_output=cfg.include_raw_model_output,
                 )
                 tw.add_metadata({"collection_elapsed_seconds": round(time.perf_counter() - ep_start, 3)})
                 tw.set_termination_reason(reason)
