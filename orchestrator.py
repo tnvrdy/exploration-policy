@@ -16,6 +16,9 @@ import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
+from collection_config import CollectionIOConfig, resolve_io_config
+from io_utils import dir_size_bytes
+
 
 def _run_task_batch(
     tasks,
@@ -23,11 +26,7 @@ def _run_task_batch(
     model,
     max_steps,
     headless,
-    writer_flush_every,
-    writer_async,
-    writer_queue_size,
-    compress_heavy,
-    include_raw_model_output,
+    io_config: CollectionIOConfig,
 ):
     try:
         from agent_goaldirected import run_task_batch
@@ -37,11 +36,7 @@ def _run_task_batch(
             model=model,
             max_steps=max_steps,
             headless=headless,
-            writer_flush_every=writer_flush_every,
-            writer_async=writer_async,
-            writer_queue_size=writer_queue_size,
-            compress_heavy=compress_heavy,
-            include_raw_model_output=include_raw_model_output,
+            io_config=io_config,
         )
         ok = [r for r in results if r["status"] == "ok"]
         step_latencies = []
@@ -70,11 +65,7 @@ def _run_freeform(
     max_steps,
     headless,
     label_mode,
-    writer_flush_every,
-    writer_async,
-    writer_queue_size,
-    compress_heavy,
-    include_raw_model_output,
+    io_config: CollectionIOConfig,
 ):
     try:
         from agent_freeform import run_freeform_session
@@ -86,11 +77,7 @@ def _run_freeform(
             max_steps=max_steps,
             headless=headless,
             label_mode=label_mode,
-            writer_flush_every=writer_flush_every,
-            writer_async=writer_async,
-            writer_queue_size=writer_queue_size,
-            compress_heavy=compress_heavy,
-            include_raw_model_output=include_raw_model_output,
+            io_config=io_config,
         )
         from trajectory_store import load_trajectory
         meaningful = sum(
@@ -100,7 +87,7 @@ def _run_freeform(
         total_steps = sum(
             load_trajectory(td, include_heavy=False)["metadata"].get("num_steps", 0) for td in traj_dirs
         )
-        total_bytes = sum(_dir_size_bytes(Path(td)) for td in traj_dirs)
+        total_bytes = sum(dir_size_bytes(Path(td)) for td in traj_dirs)
         return {
             "status": "ok",
             "seed_url": seed_url,
@@ -161,6 +148,14 @@ def run_tasks(
     if llm_qps is not None:
         os.environ["LLM_RATE_LIMIT_QPS"] = str(llm_qps)
         os.environ.setdefault("LLM_RETRY_TELEMETRY_FILE", str(Path(trajectories_dir) / "llm_retry_telemetry.jsonl"))
+    io_config = resolve_io_config(
+        None,
+        writer_flush_every=writer_flush_every,
+        writer_async=writer_async,
+        writer_queue_size=writer_queue_size,
+        compress_heavy=compress_heavy,
+        include_raw_model_output=include_raw_model_output,
+    )
     tasks = _load_tasks(tasks_path, limit=limit)
     n_workers = min(max_workers, len(tasks))
     chunks = _chunk(tasks, n_workers)
@@ -180,11 +175,7 @@ def run_tasks(
                 model,
                 max_steps,
                 headless,
-                writer_flush_every,
-                writer_async,
-                writer_queue_size,
-                compress_heavy,
-                include_raw_model_output,
+                io_config,
             ): i
             for i, ch in enumerate(chunks)
         }
@@ -253,6 +244,14 @@ def run_freeform(
     if llm_qps is not None:
         os.environ["LLM_RATE_LIMIT_QPS"] = str(llm_qps)
         os.environ.setdefault("LLM_RETRY_TELEMETRY_FILE", str(Path(trajectories_dir) / "llm_retry_telemetry.jsonl"))
+    io_config = resolve_io_config(
+        None,
+        writer_flush_every=writer_flush_every,
+        writer_async=writer_async,
+        writer_queue_size=writer_queue_size,
+        compress_heavy=compress_heavy,
+        include_raw_model_output=include_raw_model_output,
+    )
     if seeds is None:
         from task_generator import DEFAULT_SEEDS
         seeds = [s["url"] for s in DEFAULT_SEEDS]
@@ -274,11 +273,7 @@ def run_freeform(
                 max_steps,
                 headless,
                 "deferred",
-                writer_flush_every,
-                writer_async,
-                writer_queue_size,
-                compress_heavy,
-                include_raw_model_output,
+                io_config,
             ): i
             for i in range(max_workers)
         }
@@ -339,13 +334,6 @@ def _p95(values: list[float]) -> float | None:
     idx = max(0, min(len(values) - 1, int(len(values) * 0.95) - 1))
     return round(values[idx], 2)
 
-
-def _dir_size_bytes(path: Path) -> int:
-    total = 0
-    for p in path.rglob("*"):
-        if p.is_file():
-            total += p.stat().st_size
-    return total
 
 
 if __name__ == "__main__":
