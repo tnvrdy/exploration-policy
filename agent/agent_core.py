@@ -124,6 +124,19 @@ def run_steps(
     last_action: str | None = None
     step_latencies_ms: list[float] = []
 
+    # persist pre-action initial state as a full snapshot...
+    # this uses step=-1 to avoid colliding with action steps 0..N-1. lowkey jank?
+    initial_screenshot_path = tw.screenshot_path_for(-1)
+    initial_state = env.capture_full_state(initial_screenshot_path)
+    tw.write_step(
+        step=-1,
+        state=initial_state,
+        action="__initial_state__",
+        action_ok=True,
+        extra={"is_initial_state": True},
+        count_toward_steps=False,
+    )
+
     for step_num in range(max_steps):
         step_start = time.perf_counter()
         obs = env.get_text_observation()
