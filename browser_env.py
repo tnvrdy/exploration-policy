@@ -335,7 +335,12 @@ class BrowserEnv:
         self.page.screenshot(path=str(p))
         return p
 
-    def capture_full_state(self, screenshot_path: str | Path) -> dict:
+    def capture_full_state(
+        self,
+        screenshot_path: str | Path | None,
+        *,
+        include_screenshot: bool = True,
+    ) -> dict:
         """
         Capture everything we log per step: URL, title, AX tree, HTML,
         and a viewport screenshot.
@@ -347,14 +352,17 @@ class BrowserEnv:
         except Exception:
             title = "(loading...)"
 
-        self.screenshot(screenshot_path)
+        screenshot_str = ""
+        if include_screenshot and screenshot_path:
+            self.screenshot(screenshot_path)
+            screenshot_str = str(screenshot_path)
 
         return {
             "url": self.page.url,
             "title": title,
             "ax_tree": self.get_ax_tree(),
             "html": self.get_html(),
-            "screenshot_path": str(screenshot_path),
+            "screenshot_path": screenshot_str,
         }
 
     # action execution
