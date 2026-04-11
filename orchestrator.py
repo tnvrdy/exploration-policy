@@ -10,15 +10,16 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import os
 import time
+import traceback
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 from utils.collection_config import CollectionIOConfig, resolve_io_config
 from utils.io_utils import dir_size_bytes
 from agent.agent_goaldirected import _validate_max_steps
+from trajectory_store import load_trajectory_metadata
 
 
 def _run_task_batch(
@@ -27,6 +28,7 @@ def _run_task_batch(
     model,
     max_steps,
     headless,
+    collect_size_metrics,
     io_config: CollectionIOConfig,
 ):
     try:
@@ -37,6 +39,7 @@ def _run_task_batch(
             model=model,
             max_steps=max_steps,
             headless=headless,
+            collect_size_metrics=collect_size_metrics,
             io_config=io_config,
         )
         ok = [r for r in results if r["status"] == "ok"]
@@ -51,11 +54,15 @@ def _run_task_batch(
             "errors": len(results) - len(ok),
             "total_steps": sum(r.get("num_steps", 0) for r in ok),
             "bytes_written": sum(r.get("bytes_written", 0) for r in ok),
-            "total_elapsed_seconds": sum(r.get("elapsed_seconds", 0.0) for r in ok),
             "step_latency_samples_ms": step_latencies,
         }
     except Exception as e:
-        return {"status": "error", "error_type": type(e).__name__, "error": str(e)}
+        return {
+            "status": "error",
+            "error_type": type(e).__name__,
+            "error": str(e),
+            "traceback": traceback.format_exc(),
+        }
 
 
 def _run_freeform(
@@ -65,7 +72,8 @@ def _run_freeform(
     model,
     max_steps,
     headless,
-    label_mode,
+    collect_size_metrics,
+    return_trajectory_dirs,
     io_config: CollectionIOConfig,
 ):
     try:
@@ -77,18 +85,17 @@ def _run_freeform(
             model=model,
             max_steps=max_steps,
             headless=headless,
-            label_mode=label_mode,
+            label_mode="deferred",
             io_config=io_config,
         )
-        from trajectory_store import load_trajectory
-        meaningful = sum(
-            1 for td in traj_dirs
-            if load_trajectory(td, include_heavy=False)["metadata"].get("label_result", {}).get("meaningful")
-        )
-        total_steps = sum(
-            load_trajectory(td, include_heavy=False)["metadata"].get("num_steps", 0) for td in traj_dirs
-        )
-        total_bytes = sum(dir_size_bytes(Path(td)) for td in traj_dirs)
+        meaningful = 0
+        total_steps = 0
+        for td in traj_dirs:
+            meta = load_trajectory_metadata(td)
+            if meta.get("label_result", {}).get("meaningful"):
+                meaningful += 1
+            total_steps += int(meta.get("num_steps", 0))
+        total_bytes = sum(dir_size_bytes(Path(td)) for td in traj_dirs) if collect_size_metrics else 0
         return {
             "status": "ok",
             "seed_url": seed_url,
@@ -96,15 +103,24 @@ def _run_freeform(
             "meaningful": meaningful,
             "total_steps": total_steps,
             "bytes_written": total_bytes,
-            "trajectory_dirs": [str(td) for td in traj_dirs],
+            "trajectory_dirs": [str(td) for td in traj_dirs] if return_trajectory_dirs else [],
         }
     except Exception as e:
-        return {"status": "error", "error_type": type(e).__name__, "error": str(e)}
+        return {
+            "status": "error",
+            "error_type": type(e).__name__,
+            "error": str(e),
+            "traceback": traceback.format_exc(),
+        }
 
 
 def _chunk(lst, n):
-    k = math.ceil(len(lst) / n) if n > 0 else len(lst)
-    return [lst[i:i + k] for i in range(0, len(lst), k)] if lst else []
+    if not lst:
+        return []
+    if n <= 0:
+        return [lst]
+    k = (len(lst) + n - 1) // n
+    return [lst[i:i + k] for i in range(0, len(lst), k)]
 
 
 def _load_tasks(path, limit=None):
@@ -126,6 +142,82 @@ def _write_summary(summary, trajectories_dir):
     return p
 
 
+def _configure_llm_limits(trajectories_dir: str | Path, llm_qps: float | None) -> None:
+    if llm_qps is None:
+        return
+    os.environ["LLM_RATE_LIMIT_QPS"] = str(llm_qps)
+    os.environ.setdefault("LLM_RETRY_TELEMETRY_FILE", str(Path(trajectories_dir) / "llm_retry_telemetry.jsonl"))
+
+
+def _build_io_config(
+    *,
+    trajectories_dir: str | Path,
+    writer_flush_every: int,
+    writer_async: bool,
+    writer_queue_size: int,
+    compress_heavy: bool,
+    include_raw_model_output: bool,
+    screenshot_every_n_steps: int,
+    scale_mode: bool,
+    llm_qps: float | None,
+) -> CollectionIOConfig:
+    _configure_llm_limits(trajectories_dir, llm_qps)
+    if scale_mode:
+        writer_flush_every = max(writer_flush_every, 16)
+        writer_async = True
+        compress_heavy = True
+    return resolve_io_config(
+        None,
+        writer_flush_every=writer_flush_every,
+        writer_async=writer_async,
+        writer_queue_size=writer_queue_size,
+        compress_heavy=compress_heavy,
+        include_raw_model_output=include_raw_model_output,
+        screenshot_every_n_steps=screenshot_every_n_steps,
+    )
+
+
+def _maybe_quality_report(trajectories_dir: str | Path) -> dict | None:
+    try:
+        from judge import summarize_collection_quality
+
+        return summarize_collection_quality(trajectories_dir)
+    except Exception:
+        return None
+
+
+def _retry_telemetry_summary(trajectories_dir: str | Path) -> dict | None:
+    telemetry_path = Path(trajectories_dir) / "llm_retry_telemetry.jsonl"
+    if not telemetry_path.exists():
+        return None
+    retries = 0
+    exhausted = 0
+    error_types: dict[str, int] = {}
+    with open(telemetry_path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            event = row.get("event")
+            err = row.get("error_type", "unknown")
+            if event == "retry":
+                retries += 1
+                error_types[err] = error_types.get(err, 0) + 1
+            elif event == "retry_exhausted":
+                exhausted += 1
+                error_types[err] = error_types.get(err, 0) + 1
+    return {
+        "telemetry_path": str(telemetry_path),
+        "retry_events": retries,
+        "retry_exhausted_events": exhausted,
+        "error_types": error_types,
+    }
+
+
 def run_tasks(
     tasks_path: str | Path,
     trajectories_dir: str | Path = "trajectories",
@@ -140,25 +232,48 @@ def run_tasks(
     compress_heavy: bool = True,
     include_raw_model_output: bool = False,
     llm_qps: float | None = None,
+    screenshot_every_n_steps: int = 1,
+    scale_mode: bool = False,
+    collect_size_metrics: bool | None = None,
 ) -> dict:
     """
-    Run exploration episodes in parallel.
-    Supports task-driven, freeform, or mixed mode.
+    Run goal-directed exploration episodes in parallel.
     """
     trajectories_dir = str(Path(trajectories_dir).resolve())
     max_steps = _validate_max_steps(max_steps)
-    if llm_qps is not None:
-        os.environ["LLM_RATE_LIMIT_QPS"] = str(llm_qps)
-        os.environ.setdefault("LLM_RETRY_TELEMETRY_FILE", str(Path(trajectories_dir) / "llm_retry_telemetry.jsonl"))
-    io_config = resolve_io_config(
-        None,
+    if collect_size_metrics is None:
+        collect_size_metrics = not scale_mode
+    io_config = _build_io_config(
+        trajectories_dir=trajectories_dir,
         writer_flush_every=writer_flush_every,
         writer_async=writer_async,
         writer_queue_size=writer_queue_size,
         compress_heavy=compress_heavy,
         include_raw_model_output=include_raw_model_output,
+        screenshot_every_n_steps=screenshot_every_n_steps,
+        scale_mode=scale_mode,
+        llm_qps=llm_qps,
     )
     tasks = _load_tasks(tasks_path, limit=limit)
+    if not tasks:
+        print("Orchestrator: 0 tasks loaded; nothing to run.")
+        summary = {
+            "mode": "tasks",
+            "total_tasks": 0,
+            "completed": 0,
+            "errors": 0,
+            "avg_steps": 0,
+            "elapsed_seconds": 0.0,
+            "trajectories_per_minute": 0,
+            "steps_per_second": 0,
+            "bytes_written_mb": 0.0,
+            "write_mb_per_second": 0,
+            "avg_step_latency_ms": None,
+            "p95_step_latency_ms": None,
+            "quality_report": None,
+        }
+        _write_summary(summary, trajectories_dir)
+        return summary
     n_workers = min(max_workers, len(tasks))
     chunks = _chunk(tasks, n_workers)
 
@@ -166,6 +281,7 @@ def run_tasks(
     print(f"Output: {trajectories_dir}\n")
 
     results = []
+    worker_failures: list[dict] = []
     t0 = time.time()
 
     with ProcessPoolExecutor(max_workers=n_workers) as pool:
@@ -177,18 +293,30 @@ def run_tasks(
                 model,
                 max_steps,
                 headless,
+                collect_size_metrics,
                 io_config,
             ): i
             for i, ch in enumerate(chunks)
         }
         for future in as_completed(futures):
-            r = future.result()
+            worker_id = futures[future]
+            try:
+                r = future.result()
+            except Exception as e:
+                r = {
+                    "status": "error",
+                    "error_type": type(e).__name__,
+                    "error": str(e),
+                    "traceback": traceback.format_exc(),
+                    "worker_id": worker_id,
+                }
             results.append(r)
             done = len(results)
             if r["status"] == "ok":
                 print(f"  [{done}/{len(chunks)}] {r['completed']} done, {r['errors']} errors, {r['total_steps']} steps")
             else:
-                print(f"  [{done}/{len(chunks)}] ERROR: {r['error'][:80]}")
+                worker_failures.append(r)
+                print(f"  [{done}/{len(chunks)}] ERROR(worker={worker_id}): {r['error'][:120]}")
 
     elapsed = time.time() - t0
     completed = sum(r.get("completed", 0) for r in results if r["status"] == "ok")
@@ -214,12 +342,10 @@ def run_tasks(
         "write_mb_per_second": round((total_bytes / (1024 * 1024)) / elapsed, 2) if elapsed > 0 else 0,
         "avg_step_latency_ms": round(sum(lat_samples) / len(lat_samples), 2) if lat_samples else None,
         "p95_step_latency_ms": _p95(lat_samples),
+        "worker_failures": worker_failures,
     }
-    try:
-        from judge import summarize_collection_quality
-        summary["quality_report"] = summarize_collection_quality(trajectories_dir)
-    except Exception:
-        summary["quality_report"] = None
+    summary["llm_retry_telemetry"] = _retry_telemetry_summary(trajectories_dir)
+    summary["quality_report"] = None if scale_mode else _maybe_quality_report(trajectories_dir)
     sp = _write_summary(summary, trajectories_dir)
 
     print(f"\n{'=' * 50}")
@@ -246,19 +372,24 @@ def run_freeform(
     compress_heavy: bool = True,
     include_raw_model_output: bool = False,
     llm_qps: float | None = None,
+    screenshot_every_n_steps: int = 1,
+    scale_mode: bool = False,
+    collect_size_metrics: bool | None = None,
 ) -> dict:
     trajectories_dir = str(Path(trajectories_dir).resolve())
     max_steps = _validate_max_steps(max_steps)
-    if llm_qps is not None:
-        os.environ["LLM_RATE_LIMIT_QPS"] = str(llm_qps)
-        os.environ.setdefault("LLM_RETRY_TELEMETRY_FILE", str(Path(trajectories_dir) / "llm_retry_telemetry.jsonl"))
-    io_config = resolve_io_config(
-        None,
+    if collect_size_metrics is None:
+        collect_size_metrics = not scale_mode
+    io_config = _build_io_config(
+        trajectories_dir=trajectories_dir,
         writer_flush_every=writer_flush_every,
         writer_async=writer_async,
         writer_queue_size=writer_queue_size,
         compress_heavy=compress_heavy,
         include_raw_model_output=include_raw_model_output,
+        screenshot_every_n_steps=screenshot_every_n_steps,
+        scale_mode=scale_mode,
+        llm_qps=llm_qps,
     )
     if seeds is None:
         from task_generation.task_generator import DEFAULT_SEEDS
@@ -268,6 +399,7 @@ def run_freeform(
     print(f"Output: {trajectories_dir}\n")
 
     results = []
+    worker_failures: list[dict] = []
     t0 = time.time()
 
     with ProcessPoolExecutor(max_workers=max_workers) as pool:
@@ -280,20 +412,32 @@ def run_freeform(
                 model,
                 max_steps,
                 headless,
-                "deferred",
+                collect_size_metrics,
+                label_freeform,
                 io_config,
             ): i
             for i in range(max_workers)
         }
         for future in as_completed(futures):
-            r = future.result()
+            worker_id = futures[future]
+            try:
+                r = future.result()
+            except Exception as e:
+                r = {
+                    "status": "error",
+                    "error_type": type(e).__name__,
+                    "error": str(e),
+                    "traceback": traceback.format_exc(),
+                    "worker_id": worker_id,
+                }
             results.append(r)
             done = len(results)
             if r["status"] == "ok":
                 print(f"  [{done}/{max_workers}] {r['meaningful']}/{r['num_trajectories']} meaningful, "
                       f"{r['total_steps']} steps from {r['seed_url']}")
             else:
-                print(f"  [{done}/{max_workers}] ERROR: {r['error'][:80]}")
+                worker_failures.append(r)
+                print(f"  [{done}/{max_workers}] ERROR(worker={worker_id}): {r['error'][:120]}")
 
     elapsed = time.time() - t0
     ok = [r for r in results if r["status"] == "ok"]
@@ -324,12 +468,10 @@ def run_freeform(
         "bytes_written_mb": round(total_bytes / (1024 * 1024), 2),
         "write_mb_per_second": round((total_bytes / (1024 * 1024)) / elapsed, 2) if elapsed > 0 else 0,
         "labeling": label_summary,
+        "worker_failures": worker_failures,
     }
-    try:
-        from judge import summarize_collection_quality
-        summary["quality_report"] = summarize_collection_quality(trajectories_dir)
-    except Exception:
-        summary["quality_report"] = None
+    summary["llm_retry_telemetry"] = _retry_telemetry_summary(trajectories_dir)
+    summary["quality_report"] = None if scale_mode else _maybe_quality_report(trajectories_dir)
     sp = _write_summary(summary, trajectories_dir)
 
     print(f"\n{'=' * 50}")
@@ -348,9 +490,57 @@ def _p95(values: list[float]) -> float | None:
     return round(values[idx], 2)
 
 
+def _add_common_collection_args(p: argparse.ArgumentParser) -> None:
+    p.add_argument("--headed", action="store_true")
+    p.add_argument("--writer-flush-interval", type=int, default=8)
+    p.add_argument("--llm-qps", type=float, default=None)
+    p.add_argument("--writer-queue-size", type=int, default=256)
+    p.add_argument("--sync-writer", action="store_true")
+    p.add_argument("--no-compress-heavy", action="store_true")
+    p.add_argument("--screenshot-every", type=int, default=1, help="Capture screenshot every N steps (0 disables)")
+    p.add_argument("--scale-mode", action="store_true", help="Apply high-throughput profile for large shard runs")
+    size_group = p.add_mutually_exclusive_group()
+    size_group.add_argument(
+        "--collect-size-metrics",
+        dest="collect_size_metrics",
+        action="store_true",
+        help="Compute per-trajectory disk size metrics (adds filesystem overhead)",
+    )
+    size_group.add_argument(
+        "--skip-size-metrics",
+        dest="collect_size_metrics",
+        action="store_false",
+        help="Skip per-trajectory disk size scans",
+    )
+    p.set_defaults(collect_size_metrics=None)
+    p.add_argument("--include-raw-model-output", action="store_true")
+    p.add_argument("--judge", action="store_true")
+    p.add_argument("--threshold", type=int, default=3)
+
+
+def _common_run_kwargs(args) -> dict:
+    return {
+        "headless": not args.headed,
+        "writer_flush_every": args.writer_flush_interval,
+        "writer_async": not args.sync_writer,
+        "writer_queue_size": args.writer_queue_size,
+        "compress_heavy": not args.no_compress_heavy,
+        "screenshot_every_n_steps": args.screenshot_every,
+        "scale_mode": args.scale_mode,
+        "collect_size_metrics": args.collect_size_metrics,
+        "include_raw_model_output": args.include_raw_model_output,
+        "llm_qps": args.llm_qps,
+    }
+
+
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Parallel exploration orchestrator")
+    parser = argparse.ArgumentParser(
+        description=(
+            "Parallel exploration orchestrator. For cluster runs, always use an "
+            "isolated output directory per shard/job to avoid shared-write hotspots."
+        )
+    )
     sub = parser.add_subparsers(dest="mode", required=True)
 
     tp = sub.add_parser("tasks", help="Run goal-directed episodes from a tasks JSONL")
@@ -360,15 +550,7 @@ if __name__ == "__main__":
     tp.add_argument("--max-steps", type=int, default=25)
     tp.add_argument("--model", default=None)
     tp.add_argument("--limit", type=int, default=None)
-    tp.add_argument("--headed", action="store_true")
-    tp.add_argument("--writer-flush-interval", type=int, default=8)
-    tp.add_argument("--llm-qps", type=float, default=None)
-    tp.add_argument("--writer-queue-size", type=int, default=256)
-    tp.add_argument("--sync-writer", action="store_true")
-    tp.add_argument("--no-compress-heavy", action="store_true")
-    tp.add_argument("--include-raw-model-output", action="store_true")
-    tp.add_argument("--judge", action="store_true")
-    tp.add_argument("--threshold", type=int, default=3)
+    _add_common_collection_args(tp)
 
     fp = sub.add_parser("freeform", help="Run goalless freeform exploration")
     fp.add_argument("-o", "--output", default="trajectories")
@@ -376,21 +558,13 @@ if __name__ == "__main__":
     fp.add_argument("--episodes", type=int, default=5, help="Episodes per worker")
     fp.add_argument("--max-steps", type=int, default=30)
     fp.add_argument("--model", default=None)
-    fp.add_argument("--headed", action="store_true")
     fp.add_argument("--label-freeform", action="store_true", help="Run freeform labeling after collection")
-    fp.add_argument("--writer-flush-interval", type=int, default=8)
-    fp.add_argument("--llm-qps", type=float, default=None)
-    fp.add_argument("--writer-queue-size", type=int, default=256)
-    fp.add_argument("--sync-writer", action="store_true")
-    fp.add_argument("--no-compress-heavy", action="store_true")
-    fp.add_argument("--include-raw-model-output", action="store_true")
-    fp.add_argument("--judge", action="store_true")
-    fp.add_argument("--threshold", type=int, default=3)
+    _add_common_collection_args(fp)
 
     args = parser.parse_args()
+    common_kwargs = _common_run_kwargs(args)
 
     if args.mode == "tasks":
-        headless = False if args.headed else True
         run_tasks(
             tasks_path=args.tasks_file,
             trajectories_dir=args.output,
@@ -398,30 +572,17 @@ if __name__ == "__main__":
             max_steps=args.max_steps,
             model=args.model,
             limit=args.limit,
-            headless=headless,
-            writer_flush_every=args.writer_flush_interval,
-            writer_async=not args.sync_writer,
-            writer_queue_size=args.writer_queue_size,
-            compress_heavy=not args.no_compress_heavy,
-            include_raw_model_output=args.include_raw_model_output,
-            llm_qps=args.llm_qps,
+            **common_kwargs,
         )
     else:
-        headless = False if args.headed else True
         run_freeform(
             trajectories_dir=args.output,
             max_workers=args.workers,
             episodes_per_worker=args.episodes,
             max_steps=args.max_steps,
             model=args.model,
-            headless=headless,
             label_freeform=args.label_freeform,
-            writer_flush_every=args.writer_flush_interval,
-            writer_async=not args.sync_writer,
-            writer_queue_size=args.writer_queue_size,
-            compress_heavy=not args.no_compress_heavy,
-            include_raw_model_output=args.include_raw_model_output,
-            llm_qps=args.llm_qps,
+            **common_kwargs,
         )
 
     if args.judge:

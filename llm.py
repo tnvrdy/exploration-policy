@@ -6,12 +6,18 @@ DashScope is OpenAI-compatible, so we use the OpenAI SDK for both providers.
 Env vars:
   QWEN_API_KEY (required for provider="qwen")
   OPENAI_API_KEY (required for provider="openai")
+  LLM_RATE_LIMIT_QPS (optional)
+  LLM_RATE_LIMIT_MODE (optional: file_lock|process|none, default=file_lock)
+  LLM_MAX_ATTEMPTS (optional, default=4)
+  LLM_RETRY_TELEMETRY_FILE (optional)
 """
 
 from __future__ import annotations
 
+import json
 import os
 import random
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -30,6 +36,8 @@ QWEN_DEFAULT_MODEL = "qwen-plus"
 OPENAI_DEFAULT_MODEL = "gpt-4o-mini"
 
 _client_cache: dict[tuple[str, str], OpenAI] = {}
+_process_rate_lock = threading.Lock()
+_process_next_allowed_ts = 0.0
 
 
 def _get_client(base_url: str, api_key: str) -> OpenAI:
@@ -111,17 +119,6 @@ def chat(
     return ""
 
 
-if __name__ == "__main__":
-    reply = chat(
-        messages=[
-            {"role": "system", "content": "You are a helpful assistant."},
-            {"role": "user", "content": "Say hello to me, Tanvi."},
-        ],
-        max_tokens=32,
-    )
-    print(repr(reply))
-
-
 def _acquire_rate_limit_slot() -> None:
     qps_raw = os.environ.get("LLM_RATE_LIMIT_QPS", "").strip()
     if not qps_raw:
@@ -132,18 +129,35 @@ def _acquire_rate_limit_slot() -> None:
         return
     if qps <= 0:
         return
+    mode = os.environ.get("LLM_RATE_LIMIT_MODE", "file_lock").strip().lower()
+    if mode in {"none", "off"}:
+        return
+    if mode in {"process", "local"}:
+        _acquire_process_local_slot(qps)
+        return
+    _acquire_file_lock_slot(qps)
 
+
+def _acquire_process_local_slot(qps: float) -> None:
+    global _process_next_allowed_ts
+    min_interval = 1.0 / qps
+    with _process_rate_lock:
+        now = time.time()
+        wait_s = max(0.0, _process_next_allowed_ts - now)
+        if wait_s > 0:
+            time.sleep(wait_s)
+            now = time.time()
+        _process_next_allowed_ts = now + min_interval
+
+
+def _acquire_file_lock_slot(qps: float) -> None:
     state_path = Path(os.environ.get("LLM_RATE_LIMIT_STATE_FILE", "/tmp/qwenloop_llm_rate_limit.state"))
     lock_path = state_path.with_suffix(state_path.suffix + ".lock")
     now = time.time()
     min_interval = 1.0 / qps
 
     with open(lock_path, "a+", encoding="utf-8") as lock_f:
-        try:
-            import fcntl
-            fcntl.flock(lock_f.fileno(), fcntl.LOCK_EX)
-        except Exception:
-            pass
+        _flock(lock_f, lock=True)
 
         last_ts = 0.0
         if state_path.exists():
@@ -158,11 +172,7 @@ def _acquire_rate_limit_slot() -> None:
             now = time.time()
         state_path.write_text(f"{now:.6f}", encoding="utf-8")
 
-        try:
-            import fcntl
-            fcntl.flock(lock_f.fileno(), fcntl.LOCK_UN)
-        except Exception:
-            pass
+        _flock(lock_f, lock=False)
 
 
 def _emit_retry_telemetry(
@@ -189,9 +199,14 @@ def _emit_retry_telemetry(
     path = Path(path_raw)
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "a", encoding="utf-8") as f:
-        f.write(json_dumps(row) + "\n")
+        f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
-def json_dumps(obj: dict) -> str:
-    import json
-    return json.dumps(obj, ensure_ascii=False)
+def _flock(file_obj, *, lock: bool) -> None:
+    try:
+        import fcntl
+
+        mode = fcntl.LOCK_EX if lock else fcntl.LOCK_UN
+        fcntl.flock(file_obj.fileno(), mode)
+    except Exception:
+        return
