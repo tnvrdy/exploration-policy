@@ -12,6 +12,7 @@ class CollectionIOConfig:
     queue_size: int = 256
     compress_heavy: bool = False
     include_raw_model_output: bool = False
+    screenshot_every_n_steps: int = 1 # will need to be less often at scale
 
 
 def resolve_io_config(
@@ -22,6 +23,7 @@ def resolve_io_config(
     writer_queue_size: int,
     compress_heavy: bool,
     include_raw_model_output: bool,
+    screenshot_every_n_steps: int,
 ) -> CollectionIOConfig:
     if io_config is not None:
         return io_config
@@ -31,4 +33,5 @@ def resolve_io_config(
         queue_size=writer_queue_size,
         compress_heavy=compress_heavy,
         include_raw_model_output=include_raw_model_output,
+        screenshot_every_n_steps=max(0, screenshot_every_n_steps),
     )
