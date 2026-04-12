@@ -234,11 +234,12 @@ def _parse_tasks_response(raw: str, url: str, seed_source: str | None = None) ->
 
 # core generation functions
 
-def _get_common_activities(url: str, description: str) -> str:
+def _get_common_activities(url: str, description: str, model: str | None = None) -> str:
     prompt = _ACTIVITIES_PROMPT.format(url=url, description=description)
     raw = chat(
         messages=[{"role": "user", "content": prompt}],
         provider="openai",
+        model=model,
         temperature=0.7,
         max_tokens=2048,
     )
@@ -353,7 +354,7 @@ def generate_tasks_for_site(
     seed_source: str | None = None,
 ) -> list[dict]:
     print(f"    stage 1: brainstorming activities ...")
-    activities_text = _get_common_activities(url, description)
+    activities_text = _get_common_activities(url, description, model=model)
 
     print(f"    stage 2: generating {n} tasks ...")
     return _generate_tasks_from_activities(
@@ -495,7 +496,7 @@ def generate_all_tasks(
         print(f"[{i + 1}/{len(seeds)}] {url}")
         try:
             print("    stage 1: brainstorming activities ...")
-            activities_text = _get_common_activities(url, desc)
+            activities_text = _get_common_activities(url, desc, model=model)
         except Exception as e:
             print(f"  WARNING: stage-1 failed for {url}: {e}")
             continue

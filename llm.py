@@ -95,17 +95,22 @@ def chat(
 
     client = _get_client(resolved_url, resolved_key)
 
+    request_kwargs = {
+        "model": resolved_model,
+        "messages": messages,
+        "temperature": temperature,
+    }
+    if resolved_provider == "openai" and resolved_model.startswith("gpt-5"):
+        request_kwargs["max_completion_tokens"] = max_tokens
+    else:
+        request_kwargs["max_tokens"] = max_tokens
+
     delay = 2.0
     MAX_ATTEMPTS = int(os.environ.get("LLM_MAX_ATTEMPTS", "4"))
     for attempt in range(MAX_ATTEMPTS):
         _acquire_rate_limit_slot()
         try:
-            response = client.chat.completions.create(
-                model=resolved_model,
-                messages=messages,
-                temperature=temperature,
-                max_tokens=max_tokens,
-            )
+            response = client.chat.completions.create(**request_kwargs)
             return response.choices[0].message.content or ""
         except _RETRYABLE as e:
             if attempt == MAX_ATTEMPTS - 1:
