@@ -43,9 +43,14 @@ interact with the page, explore content in depth. Act naturally and purposefully
 Do NOT just scroll repeatedly or click randomly. Each action should reflect genuine \
 human curiosity or intent.
 
-IMPORTANT: Stay on the current website. Do NOT use goto to navigate to a different \
-domain. Explore the site you are already on by clicking links, using search features, \
-interacting with page elements, and navigating its internal pages.
+You may follow interesting links to other domains when they arise naturally from what \
+you are viewing. Prefer organic navigation via visible links and site features. Use goto \
+sparingly and only when it reflects a plausible browsing move rather than a random jump.
+
+If an action fails, do not keep trying the same thing. Switch strategies: try a different \
+link, a search box, a menu item, back navigation, scrolling, or another relevant page. \
+Avoid actions that have already failed repeatedly. If a page looks blocked, broken, or \
+unhelpful, recover by exploring a different part of the current browsing path.
 
 {ACTION_VOCABULARY}
 
@@ -53,13 +58,14 @@ Rules:
 1. Output EXACTLY ONE action per reply, on a single line. Nothing else — no explanation, no preamble.
 2. Use only the actions listed above. Any other output will be treated as a parse error.
 3. Do NOT output stop — keep exploring for the full session.
-4. Do NOT use goto to leave the current site's domain.""".strip()
+4. Do not repeat the same failing action over and over; choose a meaningfully different next move.""".strip()
 
 
 def _build_user_message(
     obs_text: str,
     action_history: list[str],
     goal: str | None = None,
+    blocked_actions: list[str] | None = None,
 ) -> str:
     history_block = (
         "\n".join(f"  {i + 1}. {a}" for i, a in enumerate(action_history))
@@ -70,6 +76,9 @@ def _build_user_message(
     if goal:
         parts.append(f"GOAL: {goal}\n")
     parts.append(f"HISTORY:\n{history_block}\n")
+    if blocked_actions:
+        blocked_block = "\n".join(f"  - {a}" for a in blocked_actions)
+        parts.append(f"AVOID THESE FAILED ACTIONS:\n{blocked_block}\n")
     parts.append(f"PAGE:\n{obs_text}")
     return "\n".join(parts)
 
@@ -97,6 +106,19 @@ def _annotate_action(parsed, raw: str, obs: Observation, env: BrowserEnv) -> str
     return raw
 
 
+def _record_failed_action(
+    raw: str,
+    failed_action_counts: dict[str, int],
+    blocked_actions: list[str],
+) -> None:
+    action = raw.strip()
+    if not action:
+        return
+    failed_action_counts[action] = failed_action_counts.get(action, 0) + 1
+    if failed_action_counts[action] >= 3 and action not in blocked_actions:
+        blocked_actions.append(action)
+
+
 def run_steps(
     env: BrowserEnv,
     tw: TrajectoryWriter,
@@ -120,6 +142,8 @@ def run_steps(
     system_prompt = _FREEFORM_SYSTEM_PROMPT if freeform else _GOAL_DIRECTED_SYSTEM_PROMPT
     system_msg = {"role": "system", "content": system_prompt}
     action_history: list[str] = []
+    failed_action_counts: dict[str, int] = {}
+    blocked_actions: list[str] = []
     consecutive_failures = 0
     consecutive_repeats = 0
     last_action: str | None = None
@@ -150,7 +174,12 @@ def run_steps(
 
         user_msg = {
             "role": "user",
-            "content": _build_user_message(obs.text, action_history, goal=goal),
+            "content": _build_user_message(
+                obs.text,
+                action_history,
+                goal=goal,
+                blocked_actions=blocked_actions,
+            ),
         }
         raw_full = chat([system_msg, user_msg], model=model)
         raw = _first_line(raw_full)
@@ -168,6 +197,7 @@ def run_steps(
             parsed = parse_action(raw)
         except ActionParseError as e:
             parse_error = str(e)
+            _record_failed_action(raw, failed_action_counts, blocked_actions)
             print(f"  [step {step_num}] parse error: {parse_error!r}")
 
         exec_result: dict | None = None
@@ -207,6 +237,7 @@ def run_steps(
             if not exec_ok:
                 err = (exec_result or {}).get("error", "unknown")
                 history_entry = f"{raw}  [failed: {err.splitlines()[0]}]"
+                _record_failed_action(raw, failed_action_counts, blocked_actions)
                 consecutive_failures += 1
             else:
                 consecutive_failures = 0
